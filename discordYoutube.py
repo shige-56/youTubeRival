@@ -809,82 +809,223 @@ def get_thumbnail_analysis_report(video_id, thumbnail_url):
     
     return analysis
 
+def get_cached_stats(max_age_hours=1):
+    """キャッシュされた統計情報を取得"""
+    conn = sqlite3.connect('youtube_stats.db')
+    c = conn.cursor()
+    
+    # チャンネル統計の取得
+    c.execute('''
+        SELECT subscribers, views, videos, timestamp, channel_name
+        FROM channel_stats cs
+        JOIN channel_info ci ON ci.channel_id = ?
+        WHERE cs.timestamp >= datetime('now', ? || ' hours')
+        ORDER BY cs.timestamp DESC
+        LIMIT 1
+    ''', (RIVAL_CHANNEL_ID, -max_age_hours))
+    
+    result = c.fetchone()
+    
+    if result:
+        stats = {
+            "subscribers": result[0],
+            "views": result[1],
+            "videos": result[2],
+            "channel_name": result[4],
+            "is_cached": True,
+            "cache_age": result[3]
+        }
+        
+        # 最新の動画情報も取得
+        c.execute('''
+            SELECT video_id, title, published_at, views, likes, comments
+            FROM video_stats
+            WHERE published_at >= datetime('now', '-1 day')
+            ORDER BY published_at DESC
+            LIMIT 1
+        ''')
+        latest_video = c.fetchone()
+        
+        if latest_video:
+            stats.update({
+                "latest_video_id": latest_video[0],
+                "latest_video_title": latest_video[1],
+                "latest_video_published_at": latest_video[2],
+                "latest_video_views": latest_video[3],
+                "latest_video_likes": latest_video[4],
+                "latest_video_comments": latest_video[5]
+            })
+        
+        conn.close()
+        return stats
+    
+    conn.close()
+    return None
+
+def get_cached_videos(cache_type="top", max_age_hours=12):
+    """キャッシュされた動画情報を取得"""
+    conn = sqlite3.connect('youtube_stats.db')
+    c = conn.cursor()
+    
+    if cache_type == "top":
+        c.execute('''
+            SELECT last_updated, video_data 
+            FROM top_videos_cache
+            WHERE last_updated >= datetime('now', ? || ' hours')
+        ''', (-max_age_hours,))
+    else:  # recent
+        c.execute('''
+            SELECT video_id, title, published_at, views, likes, comments
+            FROM video_stats
+            WHERE published_at >= datetime('now', '-1 day')
+            AND last_updated >= datetime('now', ? || ' hours')
+            ORDER BY published_at DESC
+        ''', (-max_age_hours,))
+    
+    result = c.fetchall()
+    conn.close()
+    
+    if result:
+        if cache_type == "top":
+            import json
+            videos = json.loads(result[0][1])
+            for video in videos:
+                video["published_at"] = datetime.fromisoformat(video["published_at"])
+            return videos
+        else:
+            return [{
+                "video_id": r[0],
+                "title": r[1],
+                "published_at": datetime.fromisoformat(r[2]),
+                "views": r[3],
+                "likes": r[4],
+                "comments": r[5]
+            } for r in result]
+    
+    return None
+
+def calculate_engagement_metrics():
+    """保存済みデータを使用したエンゲージメント分析"""
+    conn = sqlite3.connect('youtube_stats.db')
+    c = conn.cursor()
+    
+    # 過去30日間の動画のエンゲージメント率を計算
+    thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
+    c.execute('''
+        SELECT 
+            title,
+            views,
+            likes,
+            comments,
+            published_at,
+            video_id
+        FROM video_stats
+        WHERE published_at >= ?
+        ORDER BY views DESC
+    ''', (thirty_days_ago,))
+    
+    videos = c.fetchall()
+    engagement_data = []
+    
+    for video in videos:
+        title, views, likes, comments, published_at, video_id = video
+        if views > 0:
+            engagement_rate = ((likes + comments) / views) * 100
+            engagement_data.append({
+                "title": title,
+                "engagement_rate": round(engagement_rate, 2),
+                "views": views,
+                "published_at": published_at,
+                "video_id": video_id
+            })
+    
+    conn.close()
+    return engagement_data
+
+def analyze_posting_pattern():
+    """投稿パターンの分析"""
+    conn = sqlite3.connect('youtube_stats.db')
+    c = conn.cursor()
+    
+    c.execute('''
+        SELECT 
+            strftime('%H', published_at) as hour,
+            strftime('%w', published_at) as day_of_week,
+            AVG(views) as avg_views,
+            COUNT(*) as post_count
+        FROM video_stats
+        GROUP BY hour, day_of_week
+        ORDER BY avg_views DESC
+    ''')
+    
+    patterns = c.fetchall()
+    conn.close()
+    
+    days = ['日', '月', '火', '水', '木', '金', '土']
+    best_patterns = []
+    
+    for hour, day_of_week, avg_views, post_count in patterns[:5]:
+        best_patterns.append({
+            "day": days[int(day_of_week)],
+            "hour": int(hour),
+            "avg_views": int(avg_views),
+            "post_count": post_count
+        })
+    
+    return best_patterns
+
 async def send_daily_report(channel):
     try:
         print("\n=== レポート生成開始 ===")
         
-        # チャンネル統計の取得
+        # チャンネル統計を取得
         channel_stats = get_channel_stats()
-        if not channel_stats:
-            print("エラー: チャンネル統計の取得に失敗しました")
-            return
+        print("チャンネル統計を取得しました")
         
-        # 新着動画の取得
-        recent_videos = get_recent_videos()
-        has_new_videos = bool(recent_videos)
-        
-        # 人気動画の取得
+        # 人気動画を取得（過去1ヶ月以内、再生数トップ3）
         top_videos = get_top_videos()
-        if not top_videos:
-            print("エラー: 人気動画の取得に失敗しました")
-            return
+        print("人気動画情報を取得しました")
+        
+        # 新着動画を取得（過去24時間以内）
+        recent_videos = get_recent_videos()
+        print("新着動画情報を取得しました")
 
         # レポートの作成
         report = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 　　🎥 **YouTubeチャンネル分析レポート** 🎥
+　　　　　　{datetime.now().strftime('%m/%d %H:%M')}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📊 **{channel_stats['channel_name']}**
+📊 **{channel_stats.get('channel_name', '不明')}**
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ┃ 👥 チャンネル登録者数: {channel_stats['subscribers']:,}
 ┃ 👀 総再生回数: {channel_stats['views']:,}
 ┃ 📹 総動画数: {channel_stats['videos']}
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-⭐️ **過去24時間の新着動画** ⭐️
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
-
-        if has_new_videos:
-            latest_video = recent_videos[0]
-            report += f"""
-┃ 📝 {latest_video['title']}
-┃ 
-┃ 👀 再生数: {latest_video['views']:,}回
-┃ 👍 高評価: {latest_video['likes']:,}
-┃ 💭 コメント: {latest_video['comments']:,}
-┃ 
-┃ 🔗 https://youtu.be/{latest_video['video_id']}"""
-        else:
-            report += """
-┃ 新着動画はありません"""
-
-        report += f"""
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🏆 **過去1ヶ月の人気動画TOP3** 🏆
-　　更新: {datetime.now().strftime('%m/%d %H:%M')}
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-┃ 
-┃ 🥇 **1位**
-┃ 📝 {top_videos[0]['title']}
-┃ 👀 {top_videos[0]['views']:,}回 
-┃ 👍 {top_videos[0]['likes']:,} ｜ 💭 {top_videos[0]['comments']:,}
-┃ 🔗 https://youtu.be/{top_videos[0]['video_id']}
-┃ 
-┃ 🥈 **2位**
-┃ 📝 {top_videos[1]['title']}
-┃ 👀 {top_videos[1]['views']:,}回
-┃ 👍 {top_videos[1]['likes']:,} ｜ 💭 {top_videos[1]['comments']:,}
-┃ 🔗 https://youtu.be/{top_videos[1]['video_id']}
-┃ 
-┃ 🥉 **3位**
-┃ 📝 {top_videos[2]['title']}
-┃ 👀 {top_videos[2]['views']:,}回
-┃ 👍 {top_videos[2]['likes']:,} ｜ 💭 {top_videos[2]['comments']:,}
-┃ 🔗 https://youtu.be/{top_videos[2]['video_id']}
-┃ 
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+
+        # 新着動画セクション（過去24時間）
+        if recent_videos:
+            report += "\n\n📝 **新着動画（過去24時間）**"
+            for video in recent_videos:
+                report += f"""
+・{video['title']}
+　👀 {video['views']:,} 👍 {video['likes']:,} 💭 {video['comments']:,}
+　🔗 https://youtu.be/{video['video_id']}"""
+        else:
+            report += "\n\n📝 新着動画はありません"
+
+        # 人気動画セクション（過去1ヶ月）
+        if top_videos:
+            report += "\n\n🎬 **人気動画TOP3（過去1ヶ月）**"
+            medals = ["🥇", "🥈", "🥉"]
+            for i, video in enumerate(top_videos[:3]):
+                report += f"""
+{medals[i]} {video['title']}
+　👀 {video['views']:,}
+　👍 {video['likes']:,}
+　💭 {video['comments']:,}
+　🔗 https://youtu.be/{video['video_id']}"""
 
         # レポートの送信
         await channel.send(report)
@@ -894,23 +1035,11 @@ async def send_daily_report(channel):
         print(f"❌ エラーが発生しました: {str(e)}")
         traceback.print_exc()
 
-# 非同期タスクをスケジュールに登録
-def daily_task():
-    asyncio.run_coroutine_threadsafe(send_daily_report(), client.loop)
-
-schedule.every().day.at("09:00").do(daily_task)
-
+# スケジュール設定を朝9時のみに変更
 @client.event
 async def on_ready():
     print(f'{client.user} としてログインしました')
-    print('利用可能なサーバー:')
-    for guild in client.guilds:
-        print(f'- {guild.name}')
-        print('利用可能なチャンネル:')
-        for channel in guild.channels:
-            if isinstance(channel, discord.TextChannel):
-                print(f'  - #{channel.name}: {channel.id}')
-
+    
     # データベースの初期化
     init_db()
     
@@ -921,8 +1050,8 @@ async def on_ready():
     else:
         print('エラー: 対象のチャンネルが見つかりません')
     
-    # 定期実行タスクの設定
-    schedule.every().day.at("20:00").do(lambda: asyncio.create_task(send_daily_report(client.get_channel(1350462901541929060))))
+    # 定期実行タスクの設定（朝9時のみ）
+    schedule.every().day.at("09:00").do(lambda: asyncio.create_task(send_daily_report(client.get_channel(1350462901541929060))))
     
     while True:
         schedule.run_pending()
