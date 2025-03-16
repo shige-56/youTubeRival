@@ -192,72 +192,47 @@ def save_stats(stats):
     conn.close()
 
 # 統計の変化を取得
-def get_stats_changes():
+def get_stats_changes(current_stats):
+    """前回と1週間前の統計との比較を取得"""
     conn = sqlite3.connect('youtube_stats.db')
     c = conn.cursor()
     
-    # 24時間前との比較
+    # 前回の統計を取得
     c.execute('''
-        SELECT 
-            subscribers, views, videos
+        SELECT subscribers, views, videos, timestamp
         FROM channel_stats 
-        WHERE timestamp >= datetime('now', '-1 day')
-        ORDER BY timestamp ASC
+        WHERE timestamp < CURRENT_DATE
+        ORDER BY timestamp DESC
         LIMIT 1
     ''')
-    yesterday_stats = c.fetchone()
+    last_stats = c.fetchone()
     
-    # 7日前との比較
+    # 7日前の統計を取得
     c.execute('''
-        SELECT 
-            subscribers, views, videos
+        SELECT subscribers, views, videos
         FROM channel_stats 
-        WHERE timestamp >= datetime('now', '-7 day')
-        ORDER BY timestamp ASC
+        WHERE timestamp <= datetime('now', '-7 days')
+        ORDER BY timestamp DESC
         LIMIT 1
     ''')
     week_ago_stats = c.fetchone()
     
-    # 最新の統計
-    c.execute('''
-        SELECT 
-            subscribers, views, videos
-        FROM channel_stats 
-        ORDER BY timestamp DESC
-        LIMIT 1
-    ''')
-    current_stats = c.fetchone()
-    
     conn.close()
     
-    if not all([yesterday_stats, week_ago_stats, current_stats]):
-        return {
-            'daily': {'subscribers': 0, 'views': 0, 'videos': 0},
-            'weekly': {'subscribers': 0, 'views': 0, 'videos': 0},
-            'weekly_growth': {'subscribers': 0, 'views': 0}
-        }
-    
-    daily_changes = {
-        'subscribers': current_stats[0] - yesterday_stats[0],
-        'views': current_stats[1] - yesterday_stats[1],
-        'videos': current_stats[2] - yesterday_stats[2]
-    }
-    
-    weekly_changes = {
-        'subscribers': current_stats[0] - week_ago_stats[0],
-        'views': current_stats[1] - week_ago_stats[1],
-        'videos': current_stats[2] - week_ago_stats[2]
-    }
-    
-    weekly_growth = {
-        'subscribers': round((weekly_changes['subscribers'] / week_ago_stats[0]) * 100, 1) if week_ago_stats[0] > 0 else 0,
-        'views': round((weekly_changes['views'] / week_ago_stats[1]) * 100, 1) if week_ago_stats[1] > 0 else 0
-    }
+    if not last_stats or not week_ago_stats:
+        return None
     
     return {
-        'daily': daily_changes,
-        'weekly': weekly_changes,
-        'weekly_growth': weekly_growth
+        'daily': {
+            'subscribers': current_stats['subscribers'] - last_stats[0],
+            'views': current_stats['views'] - last_stats[1],
+            'videos': current_stats['videos'] - last_stats[2]
+        },
+        'weekly': {
+            'subscribers': current_stats['subscribers'] - week_ago_stats[0],
+            'views': current_stats['views'] - week_ago_stats[1],
+            'videos': current_stats['videos'] - week_ago_stats[2]
+        }
     }
 
 def get_channel_name():
@@ -974,6 +949,46 @@ def analyze_posting_pattern():
     
     return best_patterns
 
+def analyze_weekly_trend():
+    """過去7日間のトレンド分析"""
+    conn = sqlite3.connect('youtube_stats.db')
+    c = conn.cursor()
+    
+    # 過去7日間の日次データを取得
+    c.execute('''
+        SELECT 
+            date(cs.timestamp) as date,
+            AVG(cs.subscribers) as avg_subscribers,
+            AVG(cs.views) as avg_views,
+            COUNT(DISTINCT vs.video_id) as new_videos
+        FROM channel_stats cs
+        LEFT JOIN video_stats vs ON date(vs.published_at) = date(cs.timestamp)
+        WHERE cs.timestamp >= datetime('now', '-7 days')
+        GROUP BY date(cs.timestamp)
+        ORDER BY date
+    ''')
+    daily_stats = c.fetchall()
+    
+    conn.close()
+    
+    if not daily_stats or len(daily_stats) < 2:  # 最低2日分のデータが必要
+        return None
+    
+    # 成長率の計算
+    first_day = daily_stats[0]
+    last_day = daily_stats[-1]
+    
+    try:
+        growth_rate = {
+            'subscribers': ((last_day[1] - first_day[1]) / first_day[1] * 100) if first_day[1] > 0 else 0,
+            'views': ((last_day[2] - first_day[2]) / first_day[2] * 100) if first_day[2] > 0 else 0,
+            'videos_per_day': sum(day[3] for day in daily_stats) / len(daily_stats)
+        }
+    except (TypeError, ZeroDivisionError):
+        return None
+    
+    return growth_rate
+
 async def send_daily_report(channel):
     try:
         print("\n=== レポート生成開始 ===")
@@ -981,6 +996,14 @@ async def send_daily_report(channel):
         # チャンネル統計を取得
         channel_stats = get_channel_stats()
         print("チャンネル統計を取得しました")
+        
+        # 統計の変化を取得
+        stats_changes = get_stats_changes(channel_stats)
+        print("統計の変化を取得しました")
+        
+        # トレンド分析を実行
+        trend_analysis = analyze_weekly_trend()
+        print("トレンド分析を実行しました")
         
         # 人気動画を取得（過去1ヶ月以内、再生数トップ3）
         top_videos = get_top_videos()
@@ -1000,9 +1023,27 @@ async def send_daily_report(channel):
 📊 **{channel_stats.get('channel_name', '不明')}**
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ┃ 👥 チャンネル登録者数: {channel_stats['subscribers']:,}
+┃ 　前日比: {f"{stats_changes['daily']['subscribers']:+,}" if stats_changes else "集計不可（データ不足）"}
+┃ 　週間比: {f"{stats_changes['weekly']['subscribers']:+,}" if stats_changes else "集計不可（データ不足）"}
+┃ 
 ┃ 👀 総再生回数: {channel_stats['views']:,}
+┃ 　前日比: {f"{stats_changes['daily']['views']:+,}" if stats_changes else "集計不可（データ不足）"}
+┃ 　週間比: {f"{stats_changes['weekly']['views']:+,}" if stats_changes else "集計不可（データ不足）"}
+┃ 
 ┃ 📹 総動画数: {channel_stats['videos']}
+┃ 　前日比: {f"{stats_changes['daily']['videos']:+,}" if stats_changes else "集計不可（データ不足）"}
+┃ 　週間比: {f"{stats_changes['weekly']['videos']:+,}" if stats_changes else "集計不可（データ不足）"}
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+
+        # トレンド分析セクション
+        report += "\n\n📈 **週間トレンド分析**"
+        if trend_analysis:
+            report += f"""
+・チャンネル登録者: {trend_analysis['subscribers']:+.1f}%
+・総再生回数: {trend_analysis['views']:+.1f}%
+・平均投稿頻度: {trend_analysis['videos_per_day']:.1f}本/日"""
+        else:
+            report += "\n・集計不可（データ不足）"
 
         # 新着動画セクション（過去24時間）
         if recent_videos:
